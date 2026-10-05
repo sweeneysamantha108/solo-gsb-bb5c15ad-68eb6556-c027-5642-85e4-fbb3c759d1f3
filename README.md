@@ -2,7 +2,7 @@
 
 基于 **Node.js + Express + SQLite（better-sqlite3）** 的 Web 工作台，用于管理水质样本的
 原瓶登记、分装 / 混样操作、**批次预演与两阶段提交**、余量守恒校验、完整来源谱系追溯、
-历史操作更正与**更正预演 / 确认两阶段**。
+历史操作更正与**更正预演 / 确认两阶段**，以及**质检原瓶隔离与受影响瓶范围判定 / 拦截**。
 
 ## 一键启动（Docker Compose）
 
@@ -47,6 +47,10 @@ npm start          # 访问 http://localhost:3000
   支持先**预演更正**（不写库，展示因重放而变化的瓶余量、目标瓶及下游瓶更正前后的原瓶精确贡献）
   再**确认更正**（凭据原子应用，结果与预演一致），也可沿用**立即更正**直接提交；
   提交后按操作顺序重算相关瓶余量。
+- **质检隔离**：对已登记原始瓶设置隔离（原因必填）/ 解除；展示全部隔离原瓶与受影响瓶
+  （每瓶命中的隔离原瓶及原因），瓶总览以红底 / 标签标出“已隔离 / 受隔离影响”，瓶详情给出原因块。
+  受影响瓶在新建操作与批次预演 / 提交中均被拦截（批内前项受影响时后项引用同拦截，整批不落库）；
+  多原瓶隔离时解除其一会提示仍受影响的瓶；解除后凭据需重新预演。
 
 ## 批次处理（本轮新增）
 
@@ -168,6 +172,92 @@ curl -s http://localhost:3000/api/bottles/ALQ-001/contributions
 现有 `POST /api/operations/:op_id/correct`（立即更正）与批次提交约定继续可用；
 工作台“操作记录与更正”页已支持 预演 → 确认 流程并展示差异。
 
+### 隔离与更正的关系
+
+历史记录在隔离期间**始终可查询**；更正仍**只按既有守恒规则**执行（不因来源涉及隔离原瓶而额外禁止）：
+更正**成功**后系统按新的来源关系**自动重算隔离影响范围**（影响可能因此扩大或缩小，见下节示例）；
+更正**失败**（会导致后续超用）时整次回滚、形成图不变，隔离状态与影响范围也维持原状。
+隔离状态变动（设置 / 更新原因 / 解除）会递增台账版本，**尚未使用**的更正确认凭据随之失效
+（确认时 409 `STALE_TOKEN`，需重新预演）；已确认凭据的重试仍幂等返回首次结果。
+
+## 质检隔离与影响范围（本轮新增）
+
+质检人员可对**已登记原始瓶**设置隔离状态并填写**非空原因**，或解除隔离；系统按
+**当前已提交来源关系**计算影响范围并在工作台 / HTTP API 中展示。
+
+**影响判定规则**
+
+- 仅原始瓶可被隔离（对衍生瓶设置返回 400 `NOT_ORIGINAL`）；原因必填（空 / 纯空白 → 400 `BAD_REASON`）。
+- **只要衍生瓶的来源链（任意路径）含隔离原瓶，该衍生瓶即受影响**；每个受影响瓶返回其命中的
+  **全部**隔离原瓶及原因（多路径汇入合并）。
+- **多个原瓶同时隔离时，解除其中一个不能放行仍受其他原瓶影响的瓶**：解除响应的 `still_affected`
+  会列出仍被其他隔离原瓶影响的瓶；直到来源链不再含任何隔离原瓶，瓶才放行。
+- **受影响瓶（含隔离原瓶自身）不得用于新分装 / 混样**：
+  - 单条提交 `POST /api/operations` → 409 `QUARANTINE_BLOCKED`，`details` 指出每个被拦截来源瓶命中的隔离原瓶；
+  - 批次预演逐条报告 `QUARANTINE_BLOCKED`（含命中原瓶与原因），**整批不通过、不发提交凭据**；
+    批次提交在事务内重跑同一校验，任一拦截则**整批不落库**；
+  - **批内前项若受影响，引用它的后项同样被拦截**（批次图 = 当前台账 + 本批条目叠加判定）。
+- 历史操作、谱系、贡献量等查询不受隔离影响，始终可用。
+- **凭据失效**：设置 / 更新隔离 / 解除隔离均递增台账版本，预演后未使用的批次提交凭据与更正确认
+  凭据自动失效（409 `STALE_TOKEN`，需重新预演）；**已成功提交的相同请求重试仍沿用原幂等结果**
+  （批次 / 操作 / 更正的幂等判定均在凭据校验之前）。同原因重复设置隔离为幂等操作，状态与版本不变。
+
+**接口**
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `PUT` | `/api/bottles/:id/quarantine` | 设置 / 更新原瓶隔离 `{reason（必填）, operator?}`；首次或原因变更 → 201 并返回重算后的 `affected`；同原因重复 → 200 幂等 |
+| `DELETE` | `/api/bottles/:id/quarantine` | 解除隔离 → 200（含 `still_affected`）；未隔离 → 409 `NOT_QUARANTINED` |
+| `GET` | `/api/quarantine` | 全部隔离原瓶 + 全部受影响瓶（每瓶 `hits`：隔离原瓶、原因、时刻、操作人） |
+| `GET` | `/api/quarantine?bottle=xxx` | 单瓶命中查询（瓶是否隔离 + `hits`）；瓶不存在 → 404 |
+
+`GET /api/bottles` 每行新增 `quarantined`（自身是否隔离）与 `quarantine_hits`（命中的隔离原瓶）；
+`GET /api/bottles/:id` 新增 `quarantine`（隔离原瓶的原因块）与 `quarantine_hits`。
+
+### 调用示例
+
+```bash
+# 1) 隔离原始瓶（原因非空；返回受影响瓶及每瓶命中的隔离原瓶）
+curl -s -X PUT http://localhost:3000/api/bottles/W2026-001/quarantine \
+  -H 'Content-Type: application/json' -d '{"reason":"浊度异常，待复检","operator":"QC-张"}'
+# → 201 {"ok":true,"bottle":"W2026-001","reason":"浊度异常，待复检",
+#    "affected":[{"bottle":"ALQ-001","hits":[{"bottle":"W2026-001","reason":"浊度异常，待复检",...}]},
+#                {"bottle":"MIX-001", ...}, {"bottle":"W2026-001", ...}], ...}
+# 同原因重复 PUT → 200 {"ok":true,"idempotent":true,...}（状态 / 台账版本不变）
+
+# 2) 查询隔离状态与影响范围（工作台“质检隔离”页同数据）
+curl -s http://localhost:3000/api/quarantine
+# → {"ledger_version":N,"quarantined":[{"bottle":"W2026-001","reason":"...","quarantined_at":"...","operator":"QC-张"}],
+#    "affected":[{"bottle":"ALQ-001","hits":[{"bottle":"W2026-001","reason":"...",...}]}, ...]}
+curl -s 'http://localhost:3000/api/quarantine?bottle=ALQ-001'   # 单瓶命中
+
+# 3) 受影响瓶用于新分装 / 混样被拦截（单条 409；批次预演逐条报 QUARANTINE_BLOCKED，整批不落库）
+curl -s http://localhost:3000/api/operations -H 'Content-Type: application/json' -d '{
+  "op_id":"OP-2001","target_bottle":"MIX-201","op_time":"2026-10-05T09:00",
+  "sources":[{"bottle":"ALQ-001","volume":10}]}'
+# → 409 {"error":{"code":"QUARANTINE_BLOCKED",
+#    "message":"来源瓶处于质检隔离 / 受隔离影响，操作已拒绝，数据未变更（命中隔离原瓶：W2026-001）",
+#    "details":[{"bottle":"ALQ-001","hits":[{"bottle":"W2026-001","reason":"浊度异常，待复检",...}]}]}}
+
+# 4) 再隔离第二个原瓶：受影响瓶的 hits 同时列出两个原瓶
+curl -s -X PUT http://localhost:3000/api/bottles/W2026-002/quarantine \
+  -H 'Content-Type: application/json' -d '{"reason":"余氯异常"}'
+# MIX-001 / ALQ-001 的 hits = [W2026-001, W2026-002]
+
+# 5) 只解除一个 → 200，still_affected 指出仍被另一原瓶影响、继续被拦截的瓶
+curl -s -X DELETE http://localhost:3000/api/bottles/W2026-002/quarantine
+# → {"ok":true,"still_affected":[{"bottle":"MIX-001","hits":[{"bottle":"W2026-001",...}]},
+#                                {"bottle":"ALQ-001", ...}], ...}
+
+# 6) 解除最后一个隔离原瓶后放行（凭据曾因隔离变动失效的，需重新预演后再提交）
+curl -s -X DELETE http://localhost:3000/api/bottles/W2026-001/quarantine
+```
+
+更正成功后影响范围自动重算的示例：若 `MIX-001` 原由 `W2026-001 + W2026-002` 混合而成（两者中
+`W2026-002` 被隔离），把创建操作更正为仅取 `W2026-001` 并确认成功后，`MIX-001` 及其下游瓶的
+来源链不再含 `W2026-002`，下一次 `GET /api/quarantine` 的影响范围即不再包含它们；若更正被守恒
+规则拒绝，则隔离状态与影响范围维持原状。
+
 ### 调用示例
 
 ```bash
@@ -211,6 +301,14 @@ curl -s http://localhost:3000/api/operations/OP-0001/corrections/confirm \
   末尾模拟重放（虚拟入库顺序与提交时的真实分配一致），返回逐条可行性与预计余量；
   提交凭据 = HMAC(计划哈希 + 台账版本)，台账每次写成功版本递增，凭据随之失效。
   提交在单事务中完成 凭据核对 → 业务校验 → 落库 → 全账重放，失败即整体回滚。
+- **质检隔离**：隔离状态记录于 `quarantines`（原瓶主键、非空原因、时刻、操作人）。影响范围只依赖
+  当前已提交来源关系（形成图）：在图上自每个瓶向上递归，来源链任意路径含隔离原瓶即命中，多原瓶
+  命中取并集——故解除其一不影响其他原瓶的命中，直到来源链不再含任何隔离原瓶才放行。单条提交在
+  事务内按当前台账判定；批次预演 / 提交把本批条目作为虚拟形成图叠加（批内前项受影响时后项引用
+  同拦截），提交时事务内重跑，任一拦截整批回滚。设置 / 更新 / 解除隔离均递增台账版本，使未使用的
+  批次 `v1` 凭据与更正 `c1` 凭据失效；各类成功请求（操作 / 批次 / 已确认更正）的重试仍走各自的
+  幂等短路，返回首次结果，不受凭据过期影响。更正成功后形成图重建即完成影响重算，更正被守恒拒绝时
+  回滚则影响不变。
 - **并发守恒**：better-sqlite3 为同步驱动，所有写操作包裹在事务中串行执行，
   并发争用同一来源瓶时不会出现超扣；已用并发压测验证（10 并发争用 400 mL，
   恰好 4 笔成功、余量归零不为负；5 并发重复提交同一操作号仅扣量一次；
@@ -232,9 +330,12 @@ curl -s http://localhost:3000/api/operations/OP-0001/corrections/confirm \
 | `POST` | `/api/batches/commit` | 批次提交（单事务）`{batch_id, items, commit_token}` → 201 / 幂等 200 / 冲突 409 |
 | `GET`  | `/api/batches` | 全部已提交批次 |
 | `GET`  | `/api/batches/:batch_id` | 批次详情（按录入顺序的条目及来源） |
-| `GET` | `/api/bottles` | 全部瓶及当前余量 |
-| `GET` | `/api/bottles/:id` | 单瓶详情：余量、来源谱系、相关操作、原瓶精确贡献量 `contributions`（新增字段，不影响既有字段） |
-| `GET` | `/api/bottles/:id/contributions` | **（新增）** 各原始瓶对该瓶的精确贡献量：原瓶编号、约分分数 mL、形成时总体积与合计；瓶不存在 404 |
+| `GET` | `/api/bottles` | 全部瓶及当前余量（含 `quarantined` / `quarantine_hits`） |
+| `GET` | `/api/bottles/:id` | 单瓶详情：余量、来源谱系、相关操作、原瓶精确贡献量 `contributions`、`quarantine` / `quarantine_hits` |
+| `GET` | `/api/bottles/:id/contributions` | 各原始瓶对该瓶的精确贡献量：原瓶编号、约分分数 mL、形成时总体积与合计；瓶不存在 404 |
+| `PUT` | `/api/bottles/:id/quarantine` | **（新增）** 设置 / 更新原瓶隔离 `{reason（必填）, operator?}` → 201 / 同原因幂等 200 / 衍生瓶 400 / 瓶不存在 404 |
+| `DELETE` | `/api/bottles/:id/quarantine` | **（新增）** 解除隔离 → 200（含 `still_affected`）/ 未隔离 409 `NOT_QUARANTINED` |
+| `GET` | `/api/quarantine` | **（新增）** 隔离原瓶清单 + 全部受影响瓶及每瓶命中的隔离原瓶与原因；支持 `?bottle=xxx` 单瓶查询 |
 | `GET` | `/api/operations` | 全部操作记录（含来源明细、目标体积与所属批次号 `batch_id`） |
 
 时间格式统一为 `YYYY-MM-DDTHH:MM`（页面用 `datetime-local` 控件），体积单位为毫升（正整数）。
@@ -245,6 +346,6 @@ curl -s http://localhost:3000/api/operations/OP-0001/corrections/confirm \
 ├── Dockerfile            # node:20，构建时安装依赖，启动时确保依赖并初始化数据
 ├── docker-compose.yml    # 一键启动，映射 3000 端口，named volume 持久化数据
 ├── package.json
-├── server.js             # Express 服务 + SQLite 台账 + 守恒校验 + 谱系查询 + 批次预演/提交 + 原瓶贡献量（精确分数）+ 更正预演/确认
-└── public/index.html     # 单页工作台（总览 / 登记 / 操作 / 批量预演提交 / 记录与更正（预演+确认）/ 贡献量展示）
+├── server.js             # Express 服务 + SQLite 台账 + 守恒校验 + 谱系查询 + 批次预演/提交 + 原瓶贡献量（精确分数）+ 更正预演/确认 + 质检隔离与影响拦截
+└── public/index.html     # 单页工作台（总览 / 登记 / 操作 / 批量预演提交 / 记录与更正（预演+确认）/ 质检隔离 / 贡献量展示）
 ```

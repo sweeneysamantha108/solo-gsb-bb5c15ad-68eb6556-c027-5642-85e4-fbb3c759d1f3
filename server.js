@@ -12,6 +12,12 @@
  *  - 更正支持两阶段：预演（不写库）给出余量变化与目标瓶及下游瓶的原瓶贡献前后对照，
  *    并签发绑定 更正计划 + 台账版本 的确认凭据；确认在单事务中核对凭据并原子应用，
  *    结果与预演一致；同一凭据重试幂等返回首次结果，不重复更正。
+ *  - 质检可对已登记原瓶设置隔离（原因非空）/ 解除隔离；按当前已提交来源关系，
+ *    来源链含隔离原瓶的衍生瓶一律视为受影响（多原瓶同时命中时全部保留，解除其一直到
+ *    不再命中才放行）。受影响瓶（含隔离原瓶自身）不得用于新分装 / 混样：单条提交、
+ *    批次预演与提交均指出被拦截的瓶；批内前项受影响时后项引用同被拦截，整批不落库。
+ *    隔离状态变动递增台账版本，未使用的批次 / 更正确认凭据随之失效；已成功提交的
+ *    相同请求重试仍沿用原幂等结果。历史记录始终可查；更正仍只按守恒规则执行。
  *  - better-sqlite3 为同步驱动，所有写操作包裹在事务中串行执行，
  *    并发请求争用同一来源瓶时天然保证体积守恒。
  */
@@ -70,6 +76,12 @@ CREATE TABLE IF NOT EXISTS correction_confirms (
   plan_hash    TEXT NOT NULL,                 -- 首次确认的更正计划哈希
   response     TEXT NOT NULL,                 -- 首次成功响应（JSON），重试时原样返回
   confirmed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS quarantines (
+  bottle_id    TEXT PRIMARY KEY REFERENCES bottles(id),
+  reason       TEXT NOT NULL,                 -- 隔离原因（非空）
+  quarantined_at TEXT NOT NULL,               -- 最近一次（重新）隔离时刻（ISO 字符串）
+  operator     TEXT                           -- 质检操作人（可选，仅记录用）
 );
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
@@ -143,6 +155,10 @@ const qVersion    = db.prepare("SELECT value FROM meta WHERE key = 'ledger_versi
 const qBumpVersion = db.prepare("UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'ledger_version'");
 const qCorrConfirmGet = db.prepare('SELECT * FROM correction_confirms WHERE token_hash = ?');
 const qCorrConfirmIns = db.prepare('INSERT INTO correction_confirms (token_hash, op_id, plan_hash, response, confirmed_at) VALUES (?, ?, ?, ?, ?)');
+const qQAll     = db.prepare('SELECT bottle_id, reason, quarantined_at, operator FROM quarantines');
+const qQGet     = db.prepare('SELECT * FROM quarantines WHERE bottle_id = ?');
+const qQIns     = db.prepare('INSERT INTO quarantines (bottle_id, reason, quarantined_at, operator) VALUES (?, ?, ?, ?)');
+const qQDel     = db.prepare('DELETE FROM quarantines WHERE bottle_id = ?');
 
 /**
  * 台账版本号：任何写操作（登记原瓶 / 单条操作 / 更正 / 批次提交）成功提交后递增。
@@ -235,6 +251,18 @@ const createOperation = db.transaction((p) => {
         `操作时间 ${p.op_time} 早于来源瓶 ${s.bottle} 的创建时间 ${b.created_time}`);
     }
   }
+  // 质检隔离拦截：来源瓶自身被隔离，或其来源链（任意路径）含隔离原瓶，均不得用于新分装 / 混样。
+  const qIdx = ledgerQuarantineIndex();
+  const blocked = [];
+  for (const s of p.sources) {
+    if (qIdx.has(s.bottle)) blocked.push(quarantineHitJson(qIdx, s.bottle));
+  }
+  if (blocked.length) {
+    throw new ApiError(409, 'QUARANTINE_BLOCKED',
+      `来源瓶处于质检隔离 / 受隔离影响，操作已拒绝，数据未变更（命中隔离原瓶：` +
+      `${[...new Set(blocked.flatMap((x) => x.hits.map((h) => h.bottle)))].sort().join('、')}）`,
+      blocked);
+  }
   qInsOp.run(p.op_id, qNextSeq.get().next, p.target, p.op_time);
   qInsBottle.run(p.target, 'derived', p.op_time, 0, p.op_id);
   for (const s of p.sources) qInsSource.run(p.op_id, s.bottle, s.volume);
@@ -313,9 +341,10 @@ function normalizeBatchItems(rawItems) {
 /**
  * 批次业务校验（预演与提交共用，提交时在事务内重跑）：
  * 编号冲突（批内 / 现有台账）、来源存在性（可引用批内前项生成的瓶）、
- * 操作时间不得早于来源创建时间。返回 Map(index -> errors)。
+ * 操作时间不得早于来源创建时间、质检隔离 / 受影响瓶不得作为来源
+ * （批内前项受影响时，引用它的后项同样拦截）。返回 Map(index -> errors)。
  */
-function validateBatchItems(items) {
+function validateBatchItems(items, qIdx) {
   const errMap = new Map();
   const pushErr = (i, code, message) => {
     if (!errMap.has(i)) errMap.set(i, []);
@@ -340,6 +369,9 @@ function validateBatchItems(items) {
         if (it.op_time < b.created_time) {
           pushErr(i, 'TIME_BEFORE_SOURCE', `第 ${n} 条：操作时间 ${it.op_time} 早于来源瓶 ${s.bottle} 的创建时间 ${b.created_time}`);
         }
+        if (qIdx && qIdx.has(s.bottle)) {
+          pushErr(i, 'QUARANTINE_BLOCKED', quarantineBlockMessage(n, qIdx, s.bottle));
+        }
         continue;
       }
       const j = targetFirst.get(s.bottle);
@@ -349,10 +381,19 @@ function validateBatchItems(items) {
         pushErr(i, 'SOURCE_NOT_YET_CREATED', `第 ${n} 条：来源瓶 ${s.bottle} 由本批第 ${j + 1} 条生成，只能引用录入顺序在前的条目生成的瓶`);
       } else if (it.op_time < items[j].op_time) {
         pushErr(i, 'TIME_BEFORE_SOURCE', `第 ${n} 条：操作时间 ${it.op_time} 早于来源瓶 ${s.bottle} 的创建时间 ${items[j].op_time}（本批第 ${j + 1} 条生成）`);
+      } else if (qIdx && qIdx.has(s.bottle)) {
+        pushErr(i, 'QUARANTINE_BLOCKED', quarantineBlockMessage(n, qIdx, s.bottle));
       }
     }
   });
   return errMap;
+}
+
+/** 批次条目的隔离拦截错误文案：列出该来源瓶命中的全部隔离原瓶及原因。 */
+function quarantineBlockMessage(n, qIdx, bottleId) {
+  const hits = qIdx.hits(bottleId);
+  return `第 ${n} 条：来源瓶 ${bottleId} 处于质检隔离 / 受隔离影响，不得用于新分装或混样` +
+    `（命中隔离原瓶：${hits.map((h) => `${h.bottle}「${h.reason}」`).join('；')}）`;
 }
 
 /**
@@ -426,7 +467,7 @@ function verifyCommitToken(token, planHash) {
     throw new ApiError(409, 'PLAN_CHANGED', '提交内容与预演时的计划不一致，请重新预演');
   }
   if (parseInt(ver, 10) !== ledgerVersion()) {
-    throw new ApiError(409, 'STALE_TOKEN', '预演后台账已发生变化（有新登记 / 操作 / 更正 / 批次提交），预演结果已失效，请重新预演');
+    throw new ApiError(409, 'STALE_TOKEN', '预演后台账已发生变化（有新登记 / 操作 / 更正 / 批次提交 / 隔离状态变动），凭据已失效，请重新预演');
   }
 }
 
@@ -451,7 +492,8 @@ const commitBatch = db.transaction((batchId, items, planHash, token) => {
     throw new ApiError(409, 'BATCH_CONFLICT', `批次号 ${batchId} 已提交过不同内容，请更换批次号`);
   }
   verifyCommitToken(token, planHash);
-  const biz = validateBatchItems(items);
+  const qIdx = buildQuarantineIndex(batchCompositionMaps(items));
+  const biz = validateBatchItems(items, qIdx);
   if (biz.size) {
     throw new ApiError(409, 'BATCH_ITEMS_INVALID', '批次条目校验失败，整批未提交', itemErrorList(items, biz));
   }
@@ -626,6 +668,72 @@ function ledgerCompositionIndex() {
   return buildCompositionIndex(origMap, derivedMap);
 }
 
+// ------------------------------------------------- 质检隔离与影响范围
+
+/**
+ * 在当前已提交形成图上叠加批次虚拟条目（与批次预演的预计贡献构图一致），
+ * 用于批次预演 / 提交时的隔离判定：批内条目可引用录入顺序在前的条目生成的瓶。
+ */
+function batchCompositionMaps(items) {
+  const { origMap, derivedMap } = loadCompositionMaps();
+  items.forEach((it, i) => {
+    if (it.target && it.sources.length > 0 && !derivedMap.has(it.target)) {
+      derivedMap.set(it.target, {
+        op_id: it.op_id || `preview:${i}`,
+        sources: it.sources.map((s) => ({ bottle: s.bottle, volume: BigInt(s.volume) })),
+      });
+    }
+  });
+  return { origMap, derivedMap };
+}
+
+/**
+ * 构建隔离影响索引：给定形成图（当前台账或叠加批次虚拟条目后的图），
+ * 计算每个瓶命中的隔离原瓶列表。
+ *  - 隔离原瓶自身命中自己，不得再作为来源使用；
+ *  - 衍生瓶只要任一形成路径的来源链含隔离原瓶即受影响，命中集合 =
+ *    全部来源命中集合之并集（多原瓶同时隔离时全部保留；解除其一直到
+ *    来源链不再含任何隔离原瓶，瓶才放行）；
+ *  - 只依赖当前已提交来源关系，不依赖余量 / 时序；更正成功后形成图重建，
+ *    影响范围随之重算，更正被守恒规则拒绝时图不变，影响也不变。
+ * 谱系不完整（来源缺失 / 循环，仅可能出现在预演的非法虚拟条目上）时
+ * 该路径不传播隔离；此类条目本身已被其他校验拦截，整批不会落库。
+ */
+function buildQuarantineIndex(maps) {
+  const { origMap, derivedMap } = maps || loadCompositionMaps();
+  const info = new Map(qQAll.all().map((r) => [r.bottle_id, {
+    bottle: r.bottle_id, reason: r.reason, quarantined_at: r.quarantined_at, operator: r.operator || null,
+  }]));
+  const memo = new Map();
+  const hitsOf = (id, stack) => {
+    if (memo.has(id)) return memo.get(id);
+    const set = new Set(info.has(id) ? [id] : []);
+    const spec = origMap.has(id) ? null : derivedMap.get(id);
+    if (spec && stack.indexOf(id) < 0) {
+      stack.push(id);
+      for (const s of spec.sources) for (const h of hitsOf(s.bottle, stack)) set.add(h);
+      stack.pop();
+    }
+    const hits = [...set].sort();
+    memo.set(id, hits);
+    return hits;
+  };
+  return {
+    has(id) { return hitsOf(id, []).length > 0; },
+    hits(id) { return hitsOf(id, []).map((qid) => info.get(qid)); },
+  };
+}
+
+/** 当前台账的隔离影响索引。 */
+function ledgerQuarantineIndex() {
+  return buildQuarantineIndex(loadCompositionMaps());
+}
+
+/** 隔离命中明细（错误 details 与查询响应用）。 */
+function quarantineHitJson(idx, bottleId) {
+  return { bottle: bottleId, hits: idx.hits(bottleId) };
+}
+
 /** 组装贡献量查询响应体：原瓶编号、精确贡献量、形成总体积与各项合计。 */
 function contributionReport(index, bottleRow) {
   const { total, map, sum } = index.get(bottleRow.id);
@@ -676,7 +784,7 @@ function verifyCorrectionToken(token, planHash) {
     throw new ApiError(409, 'PLAN_CHANGED', '确认内容与预演时的更正计划不一致，请重新预演');
   }
   if (parseInt(ver, 10) !== ledgerVersion()) {
-    throw new ApiError(409, 'STALE_TOKEN', '预演后台账已发生变化（有新登记 / 操作 / 更正 / 批次提交），预演结果已失效，请重新预演');
+    throw new ApiError(409, 'STALE_TOKEN', '预演后台账已发生变化（有新登记 / 操作 / 更正 / 批次提交 / 隔离状态变动），凭据已失效，请重新预演');
   }
 }
 
@@ -932,8 +1040,14 @@ app.post('/api/operations/:opId/corrections/confirm', wrap((req, res) => {
 
 app.get('/api/bottles', wrap((req, res) => {
   const { balances } = recompute();
+  const qIdx = ledgerQuarantineIndex();
   const rows = db.prepare('SELECT * FROM bottles ORDER BY created_time, id').all()
-    .map((b) => ({ ...b, remaining: balances.get(b.id) ?? 0 }));
+    .map((b) => ({
+      ...b,
+      remaining: balances.get(b.id) ?? 0,
+      quarantined: !!qQGet.get(b.id),
+      quarantine_hits: qIdx.hits(b.id),
+    }));
   res.json(rows);
 }));
 
@@ -941,9 +1055,14 @@ app.get('/api/bottles/:id', wrap((req, res) => {
   const b = qBottle.get(req.params.id);
   if (!b) throw new ApiError(404, 'BOTTLE_NOT_FOUND', `瓶 ${req.params.id} 不存在`);
   const { balances } = recompute();
+  const qRow = qQGet.get(b.id);
   res.json({
     ...b,
     remaining: balances.get(b.id) ?? 0,
+    quarantine: qRow
+      ? { reason: qRow.reason, quarantined_at: qRow.quarantined_at, operator: qRow.operator || null }
+      : null,
+    quarantine_hits: ledgerQuarantineIndex().hits(b.id),
     lineage: lineage(b.id),
     operations: opsInvolving(b.id),
     contributions: contributionReport(ledgerCompositionIndex(), b),
@@ -959,6 +1078,142 @@ app.get('/api/bottles/:id/contributions', wrap((req, res) => {
   const b = qBottle.get(req.params.id);
   if (!b) throw new ApiError(404, 'BOTTLE_NOT_FOUND', `瓶 ${req.params.id} 不存在`);
   res.json(contributionReport(ledgerCompositionIndex(), b));
+}));
+
+// ---------------------------------------------------------------- 质检隔离
+
+function normReason(v) {
+  if (typeof v !== 'string' || !v.trim()) {
+    throw new ApiError(400, 'BAD_REASON', '隔离原因不能为空');
+  }
+  const r = v.trim();
+  if (r.length > 500) throw new ApiError(400, 'BAD_REASON', '隔离原因不能超过 500 字');
+  return r;
+}
+
+/**
+ * 设置 / 更新原瓶隔离（事务）：仅限已登记的原始瓶。
+ * 已隔离且原因相同 → 幂等返回（不递增台账版本，不影响既有凭据）；
+ * 首次隔离或原因更新 → 写入并递增台账版本，未使用的批次 / 更正凭据随之失效。
+ */
+const setQuarantine = db.transaction((bottleId, reason, operator) => {
+  const b = qBottle.get(bottleId);
+  if (!b) throw new ApiError(404, 'BOTTLE_NOT_FOUND', `瓶 ${bottleId} 不存在`);
+  if (b.kind !== 'original') {
+    throw new ApiError(400, 'NOT_ORIGINAL',
+      `瓶 ${bottleId} 是衍生瓶，质检隔离仅可设置在已登记的原始瓶上（衍生瓶按来源链自动判定受影响）`);
+  }
+  const nowIso = new Date().toISOString();
+  const existing = qQGet.get(bottleId);
+  if (existing && existing.reason === reason) {
+    return {
+      ok: true, idempotent: true, bottle: bottleId, reason,
+      quarantined_at: existing.quarantined_at, operator: existing.operator || null,
+      affected: affectedReport(ledgerQuarantineIndex(), new Set([bottleId])),
+      message: `原始瓶 ${bottleId} 已处于隔离状态且原因相同，幂等返回，隔离状态未变更`,
+    };
+  }
+  const changed = !!existing;
+  qQDel.run(bottleId);
+  qQIns.run(bottleId, reason, nowIso, operator || null);
+  qBumpVersion.run();
+  const idx = ledgerQuarantineIndex();
+  return {
+    ok: true, idempotent: false, bottle: bottleId, reason, quarantined_at: nowIso,
+    operator: operator || null, updated: changed,
+    affected: affectedReport(idx, new Set([bottleId])),
+    message: changed
+      ? `原始瓶 ${bottleId} 的隔离原因已更新，受影响瓶范围已重算；台账版本已递增，未使用的批次 / 更正凭据已失效`
+      : `原始瓶 ${bottleId} 已隔离，来源链含该瓶的衍生瓶均受影响；台账版本已递增，未使用的批次 / 更正凭据已失效`,
+  };
+});
+
+/** 解除原瓶隔离（事务）：未隔离 → 409；成功后递增版本并重算影响范围。 */
+const releaseQuarantine = db.transaction((bottleId) => {
+  const b = qBottle.get(bottleId);
+  if (!b) throw new ApiError(404, 'BOTTLE_NOT_FOUND', `瓶 ${bottleId} 不存在`);
+  const existing = qQGet.get(bottleId);
+  if (!existing) throw new ApiError(409, 'NOT_QUARANTINED', `原始瓶 ${bottleId} 当前未隔离，无需解除`);
+  // 解除前的受影响范围（仍含该瓶的命中），用于提示“仍被其他隔离原瓶影响”的瓶。
+  const beforeIdx = ledgerQuarantineIndex();
+  const beforeAffected = affectedBottleIds(bottleId, beforeIdx);
+  qQDel.run(bottleId);
+  qBumpVersion.run();
+  const afterIdx = ledgerQuarantineIndex();
+  const stillBlocked = beforeAffected
+    .filter((id) => id !== bottleId && afterIdx.has(id))
+    .map((id) => ({ bottle: id, hits: afterIdx.hits(id) }));
+  return {
+    ok: true, bottle: bottleId,
+    released_previous: { reason: existing.reason, quarantined_at: existing.quarantined_at },
+    affected: affectedReport(afterIdx, new Set()),
+    still_affected: stillBlocked,
+    message: stillBlocked.length
+      ? `原始瓶 ${bottleId} 已解除隔离；但仍有 ${stillBlocked.length} 个瓶来源链含其他隔离原瓶，继续受影响`
+      : `原始瓶 ${bottleId} 已解除隔离；台账版本已递增，未使用的批次 / 更正凭据已失效，已按当前来源关系重算影响范围`,
+  };
+});
+
+/** 受某隔离原瓶影响（来源链任意路径含它）的瓶编号，不含该原瓶自身。 */
+function affectedBottleIds(origId, idxParam) {
+  const idx = idxParam || ledgerQuarantineIndex();
+  const rows = db.prepare('SELECT id FROM bottles').all();
+  return rows.map((r) => r.id).filter((id) => id !== origId && idx.hits(id).some((h) => h.bottle === origId)).sort();
+}
+
+/** 受影响瓶报告：瓶编号 + 命中的全部隔离原瓶及原因。 */
+function affectedReport(idx, onlyOrigSet) {
+  return db.prepare('SELECT id FROM bottles ORDER BY id').all()
+    .map((r) => r.id)
+    .filter((id) => {
+      const hits = idx.hits(id);
+      return hits.length && (!onlyOrigSet.size || [...onlyOrigSet].some((q) => hits.some((h) => h.bottle === q)));
+    })
+    .map((id) => ({ bottle: id, hits: idx.hits(id) }));
+}
+
+app.put('/api/bottles/:id/quarantine', wrap((req, res) => {
+  const bottleId = normId(req.params.id, '瓶编号');
+  const reason = normReason(req.body && req.body.reason);
+  const operator = req.body && req.body.operator != null ? String(req.body.operator).trim() || null : null;
+  const result = setQuarantine(bottleId, reason, operator);
+  res.status(result.idempotent ? 200 : 201).json(result);
+}));
+
+app.delete('/api/bottles/:id/quarantine', wrap((req, res) => {
+  const bottleId = normId(req.params.id, '瓶编号');
+  res.json(releaseQuarantine(bottleId));
+}));
+
+/**
+ * 隔离状态与影响范围查询：按当前已提交来源关系列出隔离原瓶（含原因、时间），
+ * 以及全部受影响瓶与每瓶命中的隔离原瓶及原因；?bottle=xxx 仅查单瓶命中情况。
+ */
+app.get('/api/quarantine', wrap((req, res) => {
+  const idx = ledgerQuarantineIndex();
+  const version = ledgerVersion();
+  if (req.query.bottle) {
+    const b = qBottle.get(req.query.bottle);
+    if (!b) throw new ApiError(404, 'BOTTLE_NOT_FOUND', `瓶 ${req.query.bottle} 不存在`);
+    const qRow = qQGet.get(b.id);
+    return res.json({
+      bottle: b.id, kind: b.kind,
+      quarantined: !!qRow,
+      quarantine: qRow
+        ? { reason: qRow.reason, quarantined_at: qRow.quarantined_at, operator: qRow.operator || null }
+        : null,
+      hits: idx.hits(b.id),
+      ledger_version: version,
+    });
+  }
+  const quarantined = qQAll.all().map((q) => ({
+    bottle: q.bottle_id, reason: q.reason, quarantined_at: q.quarantined_at, operator: q.operator || null,
+  })).sort((a, b) => (a.bottle < b.bottle ? -1 : a.bottle > b.bottle ? 1 : 0));
+  res.json({
+    ledger_version: version,
+    quarantined,
+    affected: quarantined.length ? affectedReport(idx, new Set()) : [],
+  });
 }));
 
 app.get('/api/operations', wrap((req, res) => {
@@ -996,8 +1251,9 @@ app.post('/api/batches/preview', wrap((req, res) => {
       ? { code: 'BATCH_ALREADY_COMMITTED', message: `批次号 ${batchId} 已成功提交过相同内容，重复提交将幂等返回，不会重复扣量` }
       : { code: 'BATCH_CONFLICT', message: `批次号 ${batchId} 已提交过不同内容，请更换批次号` });
   }
-  // 业务校验（编号冲突 / 来源存在性 / 时间先后），与提交共用同一实现
-  const biz = validateBatchItems(items);
+  // 业务校验（编号冲突 / 来源存在性 / 时间先后 / 隔离拦截），与提交共用同一实现。
+  // 隔离索引基于“当前台账 + 本批虚拟条目”，批内前项受影响时引用它的后项同被拦截。
+  const biz = validateBatchItems(items, buildQuarantineIndex(batchCompositionMaps(items)));
   for (const [i, errs] of biz) {
     if (!itemErrors.has(i)) itemErrors.set(i, []);
     itemErrors.get(i).push(...errs);
@@ -1026,15 +1282,7 @@ app.post('/api/batches/preview', wrap((req, res) => {
   // （只依赖来源与取用量，不依赖余量 / 时序），逐条计算可行条目目标瓶的预计贡献。
   // 该构图与提交后实际形成图一致，故提交后查询结果与预演必然相同；
   // 预演不写库，台账版本与凭据逻辑不受影响。
-  const { origMap, derivedMap } = loadCompositionMaps();
-  items.forEach((it, i) => {
-    if (it.target && it.sources.length > 0 && !derivedMap.has(it.target)) {
-      derivedMap.set(it.target, {
-        op_id: it.op_id || `preview:${i}`,
-        sources: it.sources.map((s) => ({ bottle: s.bottle, volume: BigInt(s.volume) })),
-      });
-    }
-  });
+  const { origMap, derivedMap } = batchCompositionMaps(items);
   const projectedIndex = buildCompositionIndex(origMap, derivedMap);
   const projectedContributions = [];
   for (const r of itemResults) {

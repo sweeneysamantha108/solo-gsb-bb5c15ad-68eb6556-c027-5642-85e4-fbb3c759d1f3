@@ -50,12 +50,19 @@ h4{margin:14px 0 6px;font-size:14px}
 .batch-item>.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:2px}
 .batch-item>.head b{font-size:13px;color:#44515d}
 .ok-text{color:var(--ok);font-weight:600}
+.tag.quar{background:#fdecea;color:var(--err)}
+.tag.affected{background:#fff2e0;color:#a85a00}
+.low-bg{background:#fdf3f2}
+.q-row{display:flex;gap:8px;margin-bottom:8px;align-items:center;flex-wrap:wrap}
+.q-row input[type=text]{flex:1;min-width:220px}
+details.qdetails{margin:8px 0}
+details.qdetails summary{cursor:pointer;font-size:13px;color:#a85a00}
 </style>
 </head>
 <body>
 <header>
   <h1>水质实验室 · 样本分装与混样溯源工作台</h1>
-  <p>原瓶登记 / 分装混样 / 批次预演与提交 / 余量守恒 / 谱系溯源 / 历史更正（预演 + 确认两阶段，冲突自动回滚）</p>
+  <p>原瓶登记 / 分装混样 / 批次预演与提交 / 余量守恒 / 谱系溯源 / 历史更正（预演 + 确认两阶段，冲突自动回滚）/ 质检隔离与影响范围</p>
 </header>
 <nav>
   <button data-tab="bottles" class="active">瓶子总览</button>
@@ -63,6 +70,7 @@ h4{margin:14px 0 6px;font-size:14px}
   <button data-tab="operation">新建分装 / 混样</button>
   <button data-tab="batch">批量预演 / 提交</button>
   <button data-tab="ops">操作记录与更正</button>
+  <button data-tab="quarantine">质检隔离</button>
 </nav>
 <main>
 <div id="msg" class="msg"></div>
@@ -157,6 +165,31 @@ h4{margin:14px 0 6px;font-size:14px}
     <div id="corrPreviewResult"></div>
   </div>
 </section>
+
+<!-- ============ 质检隔离 ============ -->
+<section id="tab-quarantine" style="display:none">
+  <div class="card">
+    <h3>设置 / 更新原瓶隔离</h3>
+    <p class="hint">质检人员可对已登记的<b>原始瓶</b>设置隔离（原因必填）；衍生瓶不可直接隔离，
+      只要其来源链（任意路径）含隔离原瓶即自动判定为受影响。多个原瓶同时隔离时，解除其中一个
+      <b>不能放行</b>仍被其他隔离原瓶影响的瓶。隔离状态变动会使未使用的批次提交 / 更正确认凭据失效；
+      已成功提交的相同请求重试仍沿用原幂等结果。</p>
+    <div class="q-row">
+      <input id="q_bottle" type="text" list="bottleList" placeholder="原始瓶编号（如 W2026-001）">
+      <input id="q_operator" type="text" placeholder="操作人（可选，如 QC-张）" style="max-width:200px">
+    </div>
+    <label>隔离原因（必填）</label>
+    <input id="q_reason" type="text" placeholder="如：浊度异常，待复检" style="width:100%;max-width:640px">
+    <p>
+      <button class="btn" id="qSet">设置 / 更新隔离</button>
+      <button class="btn secondary" id="qRel">解除该瓶隔离</button>
+    </p>
+  </div>
+  <div class="card">
+    <h3>隔离原瓶与受影响瓶（按当前已提交来源关系）</h3>
+    <div id="qPanel"><p class="hint">加载中…</p></div>
+  </div>
+</section>
 </main>
 
 <datalist id="bottleList"></datalist>
@@ -206,6 +239,7 @@ document.querySelectorAll('nav button').forEach(btn => {
     clearMsg();
     if (btn.dataset.tab === 'bottles') loadBottles();
     if (btn.dataset.tab === 'ops') loadOps();
+    if (btn.dataset.tab === 'quarantine') loadQuarantine();
   });
 });
 
@@ -218,9 +252,16 @@ async function loadBottles() {
   dl.innerHTML = '';
   for (const b of rows) {
     const tr = document.createElement('tr');
-    tr.className = 'clickable';
+    if (b.quarantined) tr.className = 'clickable low-bg';
+    else tr.className = 'clickable';
+    let tags = '';
+    if (b.quarantined) tags += ' <span class="tag quar">已隔离</span>';
+    else if (b.quarantine_hits && b.quarantine_hits.length) {
+      tr.className = 'clickable low-bg';
+      tags += ` <span class="tag affected" title="${b.quarantine_hits.map(h => escapeHtml(h.bottle + '：' + h.reason)).join('&#10;')}">受隔离影响（${b.quarantine_hits.length}）</span>`;
+    }
     tr.innerHTML =
-      `<td class="mono">${escapeHtml(b.id)}</td>` +
+      `<td class="mono">${escapeHtml(b.id)}${tags}</td>` +
       `<td><span class="tag ${b.kind}">${b.kind === 'original' ? '原始瓶' : '衍生瓶'}</span></td>` +
       `<td>${escapeHtml(b.created_time)}</td>` +
       `<td class="num">${b.kind === 'original' ? b.initial_volume : '—'}</td>` +
@@ -244,7 +285,16 @@ async function showBottle(id) {
       <p>类型：<span class="tag ${b.kind}">${b.kind === 'original' ? '原始瓶' : '衍生瓶'}</span>
       创建/采样时间：${escapeHtml(b.created_time)}
       ${b.kind === 'original' ? '初始体积：' + b.initial_volume + ' mL　' : ''}
-      <b>当前余量：${b.remaining} mL</b></p>
+      <b>当前余量：${b.remaining} mL</b></p>`;
+    if (b.quarantine) {
+      html += `<p class="low-bg" style="padding:8px 10px;border-radius:6px"><span class="tag quar">已隔离</span>
+        原因：${escapeHtml(b.quarantine.reason)}
+        <span class="hint">（${escapeHtml(b.quarantine.quarantined_at)}${b.quarantine.operator ? ' · ' + escapeHtml(b.quarantine.operator) : ''}）</span></p>`;
+    } else if (b.quarantine_hits && b.quarantine_hits.length) {
+      html += `<p class="low-bg" style="padding:8px 10px;border-radius:6px"><span class="tag affected">受隔离影响，不得用于新分装 / 混样</span><br>` +
+        b.quarantine_hits.map(h => `来源链含隔离原瓶 <span class="mono">${escapeHtml(h.bottle)}</span>：${escapeHtml(h.reason)}`).join('<br>') + '</p>';
+    }
+    html += `
       <h4>来源谱系（向上追溯至原始瓶）</h4>${renderLineage(b.lineage)}
       <h4>原瓶贡献量（精确分数 mL；形成时总体积 ${b.contributions.formation_volume} mL）</h4>
       ${renderContributions(b.contributions)}
@@ -645,6 +695,82 @@ $('batchCommit').addEventListener('click', async () => {
   } finally {
     $('batchCommit').disabled = false;
   }
+});
+
+// ---------- 质检隔离 ----------
+function renderHits(hits) {
+  if (!hits || !hits.length) return '<span class="hint">无（可正常使用）</span>';
+  return hits.map(h =>
+    `<span class="mono">${escapeHtml(h.bottle)}</span>「${escapeHtml(h.reason)}」` +
+    (h.operator ? ` <span class="hint">(${escapeHtml(h.operator)})</span>` : '')
+  ).join('；');
+}
+
+async function loadQuarantine() {
+  const panel = $('qPanel');
+  try {
+    const d = await api('/api/quarantine');
+    let html = `<p class="hint">当前台账版本：${d.ledger_version}（隔离状态变动会递增，未使用的提交 / 确认凭据随之失效）</p>`;
+    if (!d.quarantined.length) {
+      html += '<p>当前没有处于隔离状态的原始瓶。</p>';
+    } else {
+      html += '<h4>隔离中的原始瓶</h4><table><thead><tr><th>原始瓶</th><th>原因</th><th>隔离时刻</th><th>操作人</th><th></th></tr></thead><tbody>';
+      for (const q of d.quarantined) {
+        html += `<tr class="low-bg"><td class="mono">${escapeHtml(q.bottle)}</td><td>${escapeHtml(q.reason)}</td>` +
+          `<td>${escapeHtml(q.quarantined_at)}</td><td>${escapeHtml(q.operator || '—')}</td>` +
+          `<td><button class="btn secondary small q-release" data-bottle="${escapeHtml(q.bottle)}">解除隔离</button></td></tr>`;
+      }
+      html += '</tbody></table>';
+      html += `<h4>受影响瓶（来源链含隔离原瓶；含隔离原瓶自身；共 ${d.affected.length} 个，均不得用于新分装 / 混样）</h4>` +
+        '<table><thead><tr><th>受影响瓶</th><th>命中的隔离原瓶及原因</th></tr></thead><tbody>';
+      for (const a of d.affected) {
+        const self = a.hits.length === 1 && a.hits[0].bottle === a.bottle;
+        html += `<tr class="low-bg"><td class="mono">${escapeHtml(a.bottle)}${self ? ' <span class="tag quar">隔离原瓶</span>' : ''}</td>` +
+          `<td>${renderHits(a.hits)}</td></tr>`;
+      }
+      html += '</tbody></table>';
+    }
+    panel.innerHTML = html;
+    panel.querySelectorAll('.q-release').forEach(btn => btn.addEventListener('click', () => doRelease(btn.dataset.bottle)));
+  } catch (e) {
+    panel.innerHTML = '';
+    showMsg('err', e.message, e.details);
+  }
+}
+
+$('qSet').addEventListener('click', async () => {
+  clearMsg();
+  const bottle = $('q_bottle').value; const reason = $('q_reason').value; const operator = $('q_operator').value;
+  $('qSet').disabled = true;
+  try {
+    const r = await api('/api/bottles/' + encodeURIComponent(bottle.trim()) + '/quarantine', 'PUT', { reason, operator });
+    showMsg('ok', r.message + (r.idempotent ? '（幂等）' : ''));
+    if (!r.idempotent) $('q_reason').value = '';
+    loadQuarantine(); loadBottles();
+  } catch (e) {
+    showMsg('err', e.message, e.details);
+  } finally {
+    $('qSet').disabled = false;
+  }
+});
+
+async function doRelease(bottle) {
+  clearMsg();
+  try {
+    const r = await api('/api/bottles/' + encodeURIComponent(bottle) + '/quarantine', 'DELETE');
+    showMsg('ok', r.message + (r.still_affected && r.still_affected.length
+      ? '\n仍受其他隔离原瓶影响：' + r.still_affected.map(a => `${a.bottle}（${a.hits.map(h => h.bottle).join('、')}）`).join('；')
+      : ''));
+    loadQuarantine(); loadBottles();
+  } catch (e) {
+    showMsg('err', e.message, e.details);
+  }
+}
+
+$('qRel').addEventListener('click', () => {
+  const bottle = $('q_bottle').value.trim();
+  if (!bottle) { showMsg('err', '请先在上方填写要解除隔离的原始瓶编号'); return; }
+  doRelease(bottle);
 });
 
 // ---------- 启动 ----------
