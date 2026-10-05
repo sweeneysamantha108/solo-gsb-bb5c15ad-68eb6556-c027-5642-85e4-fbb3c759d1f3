@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>水质实验室 · 样本分装与混样溯源工作台</title>
+<style>
+:root{--bg:#f4f6f8;--card:#fff;--line:#dfe5ea;--pri:#0b6fa4;--pri-d:#085a86;--err:#b3261e;--ok:#1a7f37}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:#1c2530}
+header{background:linear-gradient(135deg,#0b6fa4,#0a4d73);color:#fff;padding:14px 24px}
+header h1{font-size:18px;margin:0}
+header p{margin:4px 0 0;font-size:12px;opacity:.85}
+nav{display:flex;gap:8px;padding:10px 24px;background:#fff;border-bottom:1px solid var(--line);flex-wrap:wrap}
+nav button{border:1px solid var(--line);background:#fff;padding:7px 14px;border-radius:6px;cursor:pointer;font-size:14px}
+nav button.active{background:var(--pri);color:#fff;border-color:var(--pri)}
+main{padding:20px 24px;max-width:1100px;margin:0 auto}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:16px 18px;margin-bottom:16px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{background:#f0f4f7;white-space:nowrap}
+tr.clickable{cursor:pointer}
+tr.clickable:hover{background:#f3f8fb}
+input{padding:7px 9px;border:1px solid #c7d0d8;border-radius:6px;font-size:14px}
+label{font-size:13px;color:#44515d;display:block;margin:10px 0 4px}
+.btn{background:var(--pri);color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:14px}
+.btn:hover{background:var(--pri-d)}
+.btn.secondary{background:#fff;color:var(--pri);border:1px solid var(--pri)}
+.btn.small{padding:4px 10px;font-size:13px}
+.msg{padding:10px 14px;border-radius:6px;margin-bottom:14px;font-size:14px;display:none;white-space:pre-wrap}
+.msg.ok{display:block;background:#e6f4ea;color:var(--ok);border:1px solid #b7e2c4}
+.msg.err{display:block;background:#fdecea;color:var(--err);border:1px solid #f5c6c2}
+.src-row{display:flex;gap:8px;margin-bottom:8px;align-items:center}
+.src-row input[type=text]{flex:2}
+.src-row input[type=number]{flex:1;min-width:90px}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;white-space:nowrap}
+.tag.original{background:#e3f0fb;color:#0b6fa4}
+.tag.derived{background:#efe6fb;color:#6a3fb5}
+ul.tree{list-style:none;padding-left:18px;border-left:1px dashed #b9c6d0;margin:6px 0}
+ul.tree>li{margin:4px 0}
+.mono{font-family:ui-monospace,Consolas,monospace}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 20px}
+@media(max-width:800px){.grid2{grid-template-columns:1fr}}
+h3{margin:0 0 10px;font-size:16px}
+h4{margin:14px 0 6px;font-size:14px}
+.hint{font-size:12px;color:#6b7885;margin-top:4px}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.low{color:var(--err);font-weight:600}
+.batch-item{border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin-bottom:12px;background:#fbfcfd}
+.batch-item>.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:2px}
+.batch-item>.head b{font-size:13px;color:#44515d}
+.ok-text{color:var(--ok);font-weight:600}
+</style>
+</head>
+<body>
+<header>
+  <h1>水质实验室 · 样本分装与混样溯源工作台</h1>
+  <p>原瓶登记 / 分装混样 / 批次预演与提交 / 余量守恒 / 谱系溯源 / 历史更正（预演 + 确认两阶段，冲突自动回滚）</p>
+</header>
+<nav>
+  <button data-tab="bottles" class="active">瓶子总览</button>
+  <button data-tab="register">登记原始瓶</button>
+  <button data-tab="operation">新建分装 / 混样</button>
+  <button data-tab="batch">批量预演 / 提交</button>
+  <button data-tab="ops">操作记录与更正</button>
+</nav>
+<main>
+<div id="msg" class="msg"></div>
+
+<!-- ============ 瓶子总览 ============ -->
+<section id="tab-bottles">
+  <div class="card">
+    <h3>瓶子总览（当前余量）</h3>
+    <table id="bottleTable">
+      <thead><tr><th>瓶编号</th><th>类型</th><th>创建/采样时间</th><th class="num">初始体积 (mL)</th><th class="num">当前余量 (mL)</th><th>来源操作</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <p class="hint">点击任意行查看该瓶的完整来源谱系与相关操作。</p>
+  </div>
+  <div class="card" id="bottleDetail" style="display:none"></div>
+</section>
+
+<!-- ============ 登记原始瓶 ============ -->
+<section id="tab-register" style="display:none">
+  <div class="card">
+    <h3>登记原始瓶</h3>
+    <div class="grid2">
+      <div><label>瓶编号（唯一）</label><input id="reg_id" type="text" placeholder="如 W2026-004"></div>
+      <div><label>采样时间</label><input id="reg_time" type="datetime-local" step="60"></div>
+      <div><label>初始体积（mL，正整数）</label><input id="reg_vol" type="number" min="1" step="1" placeholder="如 500"></div>
+    </div>
+    <p><button class="btn" id="regSubmit">登记</button></p>
+  </div>
+</section>
+
+<!-- ============ 新建操作 ============ -->
+<section id="tab-operation" style="display:none">
+  <div class="card">
+    <h3>新建分装 / 混样操作</h3>
+    <div class="grid2">
+      <div><label>操作号（唯一，重复提交相同内容将幂等返回）</label><input id="op_id" type="text" placeholder="如 OP-0003"></div>
+      <div><label>目标瓶编号（须为新编号）</label><input id="op_target" type="text" placeholder="如 MIX-002"></div>
+      <div><label>操作时间（不得早于任一来源瓶的创建时间）</label><input id="op_time" type="datetime-local" step="60"></div>
+    </div>
+    <h4>来源瓶与取用体积（mL，正整数；同一操作内来源不得重复）</h4>
+    <div id="opSources"></div>
+    <p>
+      <button class="btn secondary small" id="opAddRow">+ 添加来源行</button>
+      <button class="btn" id="opSubmit">提交操作</button>
+    </p>
+    <p class="hint">目标瓶体积 = 各来源取用量之和；任一时刻任一来源瓶超用，整次操作将被拒绝。</p>
+  </div>
+</section>
+
+<!-- ============ 批量预演 / 提交 ============ -->
+<section id="tab-batch" style="display:none">
+  <div class="card">
+    <h3>批次预演与提交（连续分装 / 混样作为一个批次）</h3>
+    <div class="grid2">
+      <div><label>批次号（唯一；已成功提交的相同内容重复请求将幂等返回）</label><input id="batch_id" type="text" placeholder="如 BATCH-0001"></div>
+    </div>
+    <h4>批次条目（按录入顺序排列；同一操作时间时按此顺序核算；可引用前项生成的瓶）</h4>
+    <div id="batchItems"></div>
+    <p>
+      <button class="btn secondary small" id="batchAddItem">+ 添加条目</button>
+      <button class="btn" id="batchPreview">预演</button>
+      <button class="btn" id="batchCommit" style="display:none">提交批次</button>
+    </p>
+    <p class="hint">预演不写入数据，返回逐条可行性、受影响瓶预计余量与提交凭据；凭据绑定本次计划与当前台账，
+      预演后若有新登记 / 操作 / 更正 / 批次提交，需重新预演。提交在单个事务中完成：任一条目不合法，整批不落库。</p>
+  </div>
+  <div class="card" id="batchResult" style="display:none"></div>
+</section>
+
+<!-- ============ 操作记录与更正 ============ -->
+<section id="tab-ops" style="display:none">
+  <div class="card">
+    <h3>操作记录</h3>
+    <table id="opTable">
+      <thead><tr><th>操作号</th><th>操作时间</th><th>目标瓶</th><th>来源（瓶 × 体积）</th><th class="num">目标体积 (mL)</th><th>批次</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <div class="card" id="correctCard" style="display:none">
+    <h3>更正操作取用量：<span id="corr_op" class="mono"></span></h3>
+    <p class="hint">仅可修改来源瓶与取用量。推荐先“预演更正”查看影响（因重放而变化的瓶余量、目标瓶及下游瓶
+      更正前后的原瓶精确贡献，不写库），再“确认更正”原子应用（结果与预演一致；预演后若有新登记 / 操作 /
+      更正 / 批次提交，需重新预演）。也可沿用“立即更正”直接提交；若导致后续操作超用，整次更正拒绝并回滚。</p>
+    <div id="corrSources"></div>
+    <p>
+      <button class="btn secondary small" id="corrAddRow">+ 添加来源行</button>
+      <button class="btn" id="corrPreview">预演更正</button>
+      <button class="btn" id="corrConfirm" style="display:none">确认更正</button>
+      <button class="btn secondary" id="corrSubmit">立即更正</button>
+      <button class="btn secondary" id="corrCancel">取消</button>
+    </p>
+    <div id="corrPreviewResult"></div>
+  </div>
+</section>
+</main>
+
+<datalist id="bottleList"></datalist>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+// ---------- 消息 ----------
+function showMsg(type, text, details) {
+  const el = $('msg');
+  el.className = 'msg ' + type;
+  let html = escapeHtml(text);
+  if (Array.isArray(details) && details.length) {
+    html += '\n' + details.map(c => {
+      if (c && Array.isArray(c.errors)) {
+        return `第 ${c.index + 1} 条（${c.op_id || '?'}）：` + c.errors.map(e => e.message).join('；');
+      }
+      const where = (c.index !== undefined && c.index !== null) ? `第 ${c.index + 1} 条 ` : '';
+      return `${where}操作 ${c.op_id} 从瓶 ${c.bottle} 需取 ${c.requested} mL，可用仅 ${c.available} mL`;
+    }).join('\n');
+  }
+  el.textContent = html;
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+function clearMsg() { const el = $('msg'); el.className = 'msg'; el.textContent = ''; }
+function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+// ---------- API ----------
+async function api(path, method, body) {
+  const r = await fetch(path, {
+    method: method || 'GET',
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw (j.error || { message: '请求失败（HTTP ' + r.status + '）' });
+  return j;
+}
+
+// ---------- 页签 ----------
+document.querySelectorAll('nav button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    document.querySelectorAll('main > section').forEach(s => s.style.display = 'none');
+    $('tab-' + btn.dataset.tab).style.display = '';
+    clearMsg();
+    if (btn.dataset.tab === 'bottles') loadBottles();
+    if (btn.dataset.tab === 'ops') loadOps();
+  });
+});
+
+// ---------- 瓶子总览 ----------
+async function loadBottles() {
+  const rows = await api('/api/bottles');
+  const tb = document.querySelector('#bottleTable tbody');
+  tb.innerHTML = '';
+  const dl = $('bottleList');
+  dl.innerHTML = '';
+  for (const b of rows) {
+    const tr = document.createElement('tr');
+    tr.className = 'clickable';
+    tr.innerHTML =
+      `<td class="mono">${escapeHtml(b.id)}</td>` +
+      `<td><span class="tag ${b.kind}">${b.kind === 'original' ? '原始瓶' : '衍生瓶'}</span></td>` +
+      `<td>${escapeHtml(b.created_time)}</td>` +
+      `<td class="num">${b.kind === 'original' ? b.initial_volume : '—'}</td>` +
+      `<td class="num ${b.remaining === 0 ? 'low' : ''}">${b.remaining}</td>` +
+      `<td class="mono">${escapeHtml(b.created_op || '—')}</td>`;
+    tr.addEventListener('click', () => showBottle(b.id));
+    tb.appendChild(tr);
+    const opt = document.createElement('option');
+    opt.value = b.id;
+    opt.label = `余量 ${b.remaining} mL`;
+    dl.appendChild(opt);
+  }
+}
+
+async function showBottle(id) {
+  try {
+    const b = await api('/api/bottles/' + encodeURIComponent(id));
+    const el = $('bottleDetail');
+    el.style.display = '';
+    let html = `<h3>瓶 <span class="mono">${escapeHtml(b.id)}</span> 详情</h3>
+      <p>类型：<span class="tag ${b.kind}">${b.kind === 'original' ? '原始瓶' : '衍生瓶'}</span>
+      创建/采样时间：${escapeHtml(b.created_time)}
+      ${b.kind === 'original' ? '初始体积：' + b.initial_volume + ' mL　' : ''}
+      <b>当前余量：${b.remaining} mL</b></p>
+      <h4>来源谱系（向上追溯至原始瓶）</h4>${renderLineage(b.lineage)}
+      <h4>原瓶贡献量（精确分数 mL；形成时总体积 ${b.contributions.formation_volume} mL）</h4>
+      ${renderContributions(b.contributions)}
+      <h4>相关操作</h4>`;
+    if (b.operations.as_target.length) {
+      html += '<p>由以下操作生成：</p><ul>' + b.operations.as_target.map(o =>
+        `<li class="mono">${escapeHtml(o.op_id)}（${escapeHtml(o.op_time)}）</li>`).join('') + '</ul>';
+    }
+    if (b.operations.as_source.length) {
+      html += '<p>作为来源被取用：</p><ul>' + b.operations.as_source.map(o =>
+        `<li class="mono">${escapeHtml(o.op_id)}（${escapeHtml(o.op_time)}）取用 ${o.drawn_volume} mL → ${escapeHtml(o.target_bottle)}</li>`).join('') + '</ul>';
+    }
+    if (!b.operations.as_target.length && !b.operations.as_source.length) html += '<p>暂无相关操作。</p>';
+    el.innerHTML = html;
+  } catch (e) {
+    showMsg('err', e.message, e.details);
+  }
+}
+
+function renderLineage(node) {
+  if (!node) return '';
+  if (node.original) {
+    return `<ul class="tree"><li>💧 <span class="mono">${escapeHtml(node.bottle)}</span>（原始瓶）</li></ul>`;
+  }
+  const children = (node.sources || []).map(s =>
+    `<li>← 取用 ${s.volume} mL ${renderLineage(s.node)}</li>`).join('');
+  const head = node.op
+    ? `<ul class="tree"><li>🧪 <span class="mono">${escapeHtml(node.bottle)}</span>（由操作 <span class="mono">${escapeHtml(node.op.op_id)}</span> 于 ${escapeHtml(node.op.op_time)} 生成）<ul class="tree">${children}</ul></li></ul>`
+    : `<ul class="tree"><li class="mono">${escapeHtml(node.bottle)}</li></ul>`;
+  return head;
+}
+
+// ---------- 原瓶贡献量（精确分数） ----------
+function fmtFrac(f) {
+  if (!f) return '—';
+  return f.approx_ml !== null && Number.isFinite(f.approx_ml) && f.denominator !== '1'
+    ? `${f.text}（≈${f.approx_ml.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')} mL）`
+    : `${f.text} mL`;
+}
+function renderContributions(c) {
+  if (!c || !c.contributions || !c.contributions.length) return '<p class="hint">暂无贡献量数据。</p>';
+  let html = '<table><thead><tr><th>原始瓶编号</th><th class="num">精确贡献量 (mL)</th></tr></thead><tbody>';
+  for (const row of c.contributions) {
+    html += `<tr><td class="mono">${escapeHtml(row.bottle)}</td><td class="num mono">${fmtFrac(row.contribution_ml)}</td></tr>`;
+  }
+  html += `</tbody></table><p class="hint">各项合计：<span class="mono">${fmtFrac(c.sum_ml)}</span>` +
+    `（严格等于形成时总体积 ${c.formation_volume} mL，全程精确分数分摊、未逐层舍入）</p>`;
+  return html;
+}
+
+// ---------- 登记原始瓶 ----------
+$('regSubmit').addEventListener('click', async () => {
+  clearMsg();
+  $('regSubmit').disabled = true;
+  try {
+    const r = await api('/api/bottles', 'POST', {
+      bottle_id: $('reg_id').value,
+      sample_time: $('reg_time').value,
+      initial_volume: $('reg_vol').value,
+    });
+    showMsg('ok', r.message);
+    $('reg_id').value = ''; $('reg_vol').value = '';
+    loadBottles();
+  } catch (e) {
+    showMsg('err', e.message, e.details);
+  } finally {
+    $('regSubmit').disabled = false;
+  }
+});
+
+// ---------- 来源行动态控件 ----------
+function addSourceRow(container, bottle, volume) {
+  const row = document.createElement('div');
+  row.className = 'src-row';
+  row.innerHTML =
+    `<input type="text" list="bottleList" placeholder="来源瓶编号" value="${bottle ? escapeHtml(bottle) : ''}">` +
+    `<input type="number" min="1" step="1" placeholder="体积 mL" value="${volume || ''}">` +
+    `<button type="button" class="btn secondary small">删除</button>`;
+  row.querySelector('button').addEventListener('click', () => row.remove());
+  container.appendChild(row);
+}
+
+function readSourceRows(container) {
+  return [...container.querySelectorAll('.src-row')].map(row => {
+    const [b, v] = row.querySelectorAll('input');
+    return { bottle: b.value, volume: v.value };
+  });
+}
+
+$('opAddRow').addEventListener('click', () => addSourceRow($('opSources')));
+$('corrAddRow').addEventListener('click', () => addSourceRow($('corrSources')));
+
+// ---------- 新建操作 ----------
+$('opSubmit').addEventListener('click', async () => {
+  clearMsg();
+  $('opSubmit').disabled = true;
+  try {
+    const r = await api('/api/operations', 'POST', {
+      op_id: $('op_id').value,
+      target_bottle: $('op_target').value,
+      op_time: $('op_time').value,
+      sources: readSourceRows($('opSources')),
+    });
+    showMsg('ok', r.message + (r.idempotent ? '（幂等）' : ''));
+    if (!r.idempotent) {
+      $('op_id').value = ''; $('op_target').value = '';
+      $('opSources').innerHTML = ''; addSourceRow($('opSources'));
+    }
+    loadBottles();
+  } catch (e) {
+    showMsg('err', e.message, e.details);
+  } finally {
+    $('opSubmit').disabled = false;
+  }
+});
+
+// ---------- 操作记录与更正 ----------
+async function loadOps() {
+  const rows = await api('/api/operations');
+  const tb = document.querySelector('#opTable tbody');
+  tb.innerHTML = '';
+  for (const o of rows) {
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      `<td class="mono">${escapeHtml(o.op_id)}</td>` +
+      `<td>${escapeHtml(o.op_time)}</td>` +
+      `<td class="mono">${escapeHtml(o.target_bottle)}</td>` +
+      `<td>${o.sources.map(s => `<span class="mono">${escapeHtml(s.bottle)}</span> × ${s.volume} mL`).join('<br>')}</td>` +
+      `<td class="num">${o.total}</td>` +
+      `<td class="mono">${o.batch_id ? escapeHtml(o.batch_id) : '—'}</td>` +
+      `<td><button class="btn secondary small">更正</button></td>`;
+    tr.querySelector('button').addEventListener('click', () => openCorrect(o));
+    tb.appendChild(tr);
+  }
+}
+
+function openCorrect(o) {
+  clearMsg();
+  $('corr_op').textContent = o.op_id;
+  const box = $('corrSources');
+  box.innerHTML = '';
+  for (const s of o.sources) addSourceRow(box, s.bottle, s.volume);
+  corrPreviewState = null;
+  $('corrConfirm').style.display = 'none';
+  $('corrPreviewResult').innerHTML = '';
+  $('correctCard').style.display = '';
+  $('correctCard').scrollIntoView({ behavior: 'smooth' });
+  $('corrSubmit').onclick = async () => {
+    clearMsg();
+    $('corrSubmit').disabled = true;
+    try {
+      const r = await api('/api/operations/' + encodeURIComponent(o.op_id) + '/correct', 'POST', {
+        sources: readSourceRows(box),
+      });
+      showMsg('ok', r.message);
+      $('correctCard').style.display = 'none';
+      loadOps(); loadBottles();
+    } catch (e) {
+      showMsg('err', e.message, e.details);
+    } finally {
+      $('corrSubmit').disabled = false;
+    }
+  };
+}
+
+$('corrCancel').addEventListener('click', () => { $('correctCard').style.display = 'none'; clearMsg(); });
+
+// ---------- 更正预演 / 确认（两阶段） ----------
+let corrPreviewState = null; // { opId, sourcesJson, token }：确认内容必须与预演计划一致
+
+function renderContributionChange(cc) {
+  const beforeMap = new Map(cc.before.contributions.map(c => [c.bottle, c.contribution_ml]));
+  const afterMap = new Map(cc.after.contributions.map(c => [c.bottle, c.contribution_ml]));
+  const ids = [...new Set([...beforeMap.keys(), ...afterMap.keys()])].sort();
+  let html = `<p class="mono" style="margin-bottom:2px">${escapeHtml(cc.bottle)}` +
+    `<span class="hint">（形成时总体积 ${cc.before.formation_volume} → ${cc.after.formation_volume} mL）</span></p>`;
+  html += '<table><thead><tr><th>原始瓶编号</th><th class="num">更正前贡献 (mL)</th><th class="num">更正后贡献 (mL)</th></tr></thead><tbody>';
+  for (const id of ids) {
+    html += `<tr><td class="mono">${escapeHtml(id)}</td>` +
+      `<td class="num mono">${fmtFrac(beforeMap.get(id))}</td>` +
+      `<td class="num mono">${fmtFrac(afterMap.get(id))}</td></tr>`;
+  }
+  return html + '</tbody></table>';
+}
+
+function renderCorrPreview(r) {
+  const el = $('corrPreviewResult');
+  let html = `<h4>预演结果：${r.ok
+    ? '<span class="ok-text">✓ 通过，可确认</span>'
+    : '<span class="low">✗ 未通过（未写入任何数据）</span>'}</h4>`;
+  html += `<p class="hint">${escapeHtml(r.message)}</p>`;
+  if (r.errors && r.errors.length) {
+    html += '<p class="low">' + r.errors.map(e => escapeHtml(e.message)).join('<br>') + '</p>';
+  }
+  if (r.ok) {
+    if (r.balance_changes && r.balance_changes.length) {
+      html += '<h4>瓶余量变化（按 操作时间 + 入库顺序 重放）</h4>' +
+        '<table><thead><tr><th>瓶编号</th><th class="num">更正前余量 (mL)</th><th class="num">更正后余量 (mL)</th></tr></thead><tbody>';
+      for (const c of r.balance_changes) {
+        html += `<tr><td class="mono">${escapeHtml(c.bottle)}</td><td class="num">${c.before}</td><td class="num">${c.after}</td></tr>`;
+      }
+      html += '</tbody></table>';
+    } else {
+      html += '<p class="hint">无瓶余量变化。</p>';
+    }
+    if (r.contribution_changes && r.contribution_changes.length) {
+      html += '<h4>目标瓶及下游瓶的原瓶精确贡献变化（分数 mL）</h4>';
+      for (const cc of r.contribution_changes) html += renderContributionChange(cc);
+    } else {
+      html += '<p class="hint">无原瓶贡献变化。</p>';
+    }
+    html += `<p class="hint">确认凭据已签发（绑定本更正计划与台账版本 ${r.ledger_version}）：` +
+      '点击“确认更正”原子应用，结果与预演一致。</p>';
+  }
+  el.innerHTML = html;
+}
+
+$('corrPreview').addEventListener('click', async () => {
+  clearMsg();
+  const opId = $('corr_op').textContent;
+  $('corrPreview').disabled = true;
+  try {
+    const payload = { sources: readSourceRows($('corrSources')) };
+    const r = await api('/api/operations/' + encodeURIComponent(opId) + '/corrections/preview', 'POST', payload);
+    renderCorrPreview(r);
+    corrPreviewState = r.ok ? { opId, sourcesJson: JSON.stringify(payload.sources), token: r.confirm_token } : null;
+    $('corrConfirm').style.display = r.ok ? '' : 'none';
+  } catch (e) {
+    corrPreviewState = null;
+    $('corrConfirm').style.display = 'none';
+    showMsg('err', e.message, e.details);
+  } finally {
+    $('corrPreview').disabled = false;
+  }
+});
+
+$('corrConfirm').addEventListener('click', async () => {
+  clearMsg();
+  if (!corrPreviewState) { showMsg('err', '请先预演更正'); return; }
+  const sources = readSourceRows($('corrSources'));
+  if (JSON.stringify(sources) !== corrPreviewState.sourcesJson) {
+    showMsg('err', '来源内容在预演后已被修改，请重新预演');
+    $('corrConfirm').style.display = 'none';
+    corrPreviewState = null;
+    return;
+  }
+  $('corrConfirm').disabled = true;
+  try {
+    const r = await api('/api/operations/' + encodeURIComponent(corrPreviewState.opId) + '/corrections/confirm', 'POST', {
+      sources, confirm_token: corrPreviewState.token,
+    });
+    showMsg('ok', r.message + (r.idempotent ? '（幂等）' : ''));
+    corrPreviewState = null;
+    $('corrConfirm').style.display = 'none';
+    $('correctCard').style.display = 'none';
+    loadOps(); loadBottles();
+  } catch (e) {
+    showMsg('err', e.message, e.details);
+    if (e.code === 'STALE_TOKEN' || e.code === 'PLAN_CHANGED' || e.code === 'BAD_TOKEN') {
+      $('corrConfirm').style.display = 'none';
+      corrPreviewState = null;
+    }
+  } finally {
+    $('corrConfirm').disabled = false;
+  }
+});
+
+// ---------- 批次预演 / 提交 ----------
+let lastPreview = null; // { payloadJson, token }：提交内容必须与预演计划一致
+
+function addBatchItemCard() {
+  const box = $('batchItems');
+  const div = document.createElement('div');
+  div.className = 'batch-item';
+  div.innerHTML =
+    '<div class="head"><b>条目 <span class="bi-no"></span></b>' +
+    '<button type="button" class="btn secondary small bi-del">删除条目</button></div>' +
+    '<div class="grid2">' +
+    '<div><label>操作号（唯一）</label><input class="bi-op" type="text" placeholder="如 OP-0101"></div>' +
+    '<div><label>目标瓶编号（须为新编号）</label><input class="bi-target" type="text" placeholder="如 MIX-101"></div>' +
+    '<div><label>操作时间</label><input class="bi-time" type="datetime-local" step="60"></div>' +
+    '</div>' +
+    '<label>来源瓶与取用体积（mL，正整数；同一操作内来源不得重复）</label>' +
+    '<div class="bi-sources"></div>' +
+    '<p><button type="button" class="btn secondary small bi-addsrc">+ 添加来源行</button></p>';
+  div.querySelector('.bi-addsrc').addEventListener('click', () => addSourceRow(div.querySelector('.bi-sources')));
+  div.querySelector('.bi-del').addEventListener('click', () => { div.remove(); renumberBatchItems(); });
+  addSourceRow(div.querySelector('.bi-sources'));
+  box.appendChild(div);
+  renumberBatchItems();
+}
+
+function renumberBatchItems() {
+  [...$('batchItems').querySelectorAll('.batch-item')].forEach((d, i) => {
+    d.querySelector('.bi-no').textContent = i + 1;
+  });
+}
+
+function readBatchPayload() {
+  return {
+    batch_id: $('batch_id').value,
+    items: [...$('batchItems').querySelectorAll('.batch-item')].map(div => ({
+      op_id: div.querySelector('.bi-op').value,
+      target_bottle: div.querySelector('.bi-target').value,
+      op_time: div.querySelector('.bi-time').value,
+      sources: readSourceRows(div.querySelector('.bi-sources')),
+    })),
+  };
+}
+
+function renderBatchPreview(r) {
+  const el = $('batchResult');
+  el.style.display = '';
+  let html = `<h3>预演结果：${r.ok
+    ? '<span class="ok-text">✓ 通过，可提交</span>'
+    : '<span class="low">✗ 未通过（未写入任何数据）</span>'}</h3>`;
+  html += `<p>${escapeHtml(r.message)}</p>`;
+  if (r.errors && r.errors.length) {
+    html += '<p class="low">' + r.errors.map(e => escapeHtml(e.message)).join('<br>') + '</p>';
+  }
+  html += '<table><thead><tr><th>#</th><th>操作号</th><th>可行性</th><th>问题</th></tr></thead><tbody>';
+  for (const it of r.items) {
+    html += `<tr><td>${it.index + 1}</td><td class="mono">${escapeHtml(it.op_id || '—')}</td>` +
+      `<td>${it.ok ? '<span class="ok-text">✓ 可行</span>' : '<span class="low">✗ 不可行</span>'}</td>` +
+      `<td>${it.errors.length ? it.errors.map(e => escapeHtml(e.message)).join('<br>') : '—'}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  if (r.projected_balances && r.projected_balances.length) {
+    html += '<h4>受影响瓶预计余量（按 操作时间 + 录入顺序 重放）</h4>' +
+      '<table><thead><tr><th>瓶编号</th><th></th><th class="num">预计余量 (mL)</th></tr></thead><tbody>';
+    for (const b of r.projected_balances) {
+      html += `<tr><td class="mono">${escapeHtml(b.bottle)}</td>` +
+        `<td>${b.in_batch ? '<span class="tag derived">本批新建</span>' : ''}</td>` +
+        `<td class="num ${b.remaining === 0 ? 'low' : ''}">${b.remaining}</td></tr>`;
+    }
+    html += '</tbody></table>';
+  }
+  if (r.projected_contributions && r.projected_contributions.length) {
+    html += '<h4>可行条目目标瓶的预计原瓶贡献（精确分数 mL，提交后查询结果与此一致）</h4>';
+    for (const pc of r.projected_contributions) {
+      html += `<p class="mono">第 ${pc.index + 1} 条 · ${escapeHtml(pc.op_id)} → ${escapeHtml(pc.target_bottle)}（形成时总体积 ${pc.formation_volume} mL）</p>`;
+      html += renderContributions(pc);
+    }
+  }
+  if (r.commit_token) {
+    html += `<p class="hint">提交凭据已签发（绑定本计划与台账版本 ${r.ledger_version}）：` +
+      `<span class="mono">${escapeHtml(r.commit_token.slice(0, 20))}…</span>　点击“提交批次”完成登记。</p>`;
+  }
+  el.innerHTML = html;
+  el.scrollIntoView({ behavior: 'smooth' });
+}
+
+$('batchAddItem').addEventListener('click', addBatchItemCard);
+
+$('batchPreview').addEventListener('click', async () => {
+  clearMsg();
+  $('batchPreview').disabled = true;
+  try {
+    const payload = readBatchPayload();
+    const r = await api('/api/batches/preview', 'POST', payload);
+    renderBatchPreview(r);
+    lastPreview = r.ok ? { payloadJson: JSON.stringify(payload), token: r.commit_token } : null;
+    $('batchCommit').style.display = r.ok ? '' : 'none';
+  } catch (e) {
+    lastPreview = null;
+    $('batchCommit').style.display = 'none';
+    showMsg('err', e.message, e.details);
+  } finally {
+    $('batchPreview').disabled = false;
+  }
+});
+
+$('batchCommit').addEventListener('click', async () => {
+  clearMsg();
+  if (!lastPreview) { showMsg('err', '请先预演'); return; }
+  const payload = readBatchPayload();
+  if (JSON.stringify(payload) !== lastPreview.payloadJson) {
+    showMsg('err', '表单内容在预演后已被修改，请重新预演');
+    $('batchCommit').style.display = 'none';
+    lastPreview = null;
+    return;
+  }
+  $('batchCommit').disabled = true;
+  try {
+    const r = await api('/api/batches/commit', 'POST', { ...payload, commit_token: lastPreview.token });
+    showMsg('ok', r.message + (r.idempotent ? '（幂等）' : ''));
+    $('batchCommit').style.display = 'none';
+    lastPreview = null;
+    $('batchItems').innerHTML = ''; addBatchItemCard();
+    $('batchResult').style.display = 'none';
+    loadBottles();
+  } catch (e) {
+    showMsg('err', e.message, e.details);
+    if (e.code === 'STALE_TOKEN' || e.code === 'PLAN_CHANGED' || e.code === 'BAD_TOKEN') {
+      $('batchCommit').style.display = 'none';
+      lastPreview = null;
+    }
+  } finally {
+    $('batchCommit').disabled = false;
+  }
+});
+
+// ---------- 启动 ----------
+addSourceRow($('opSources'));
+addBatchItemCard();
+loadBottles();
+</script>
+</body>
+</html>
